@@ -2,10 +2,10 @@
 pragma solidity ^0.8.28;
 
 /*
-  SimpleLotTrade v0.4.1 (Mordor Testnet)
-  -------------------------------------
+  SimpleLotTrade v0.5.0 (Design)
+  ------------------------------
   - Tick-only Central Limit Order Book for TKN10K lots (decimals=0), priced in TETC (18 decimals)
-  - FOK takers only (same traversal behavior as v0.3.x)
+  - FOK takers only
   - NO internal deposit/withdraw balances:
       * Makers escrow tokens inside the contract on order placement
       * Escrow is released on fill/partial fill/cancel
@@ -13,7 +13,12 @@ pragma solidity ^0.8.28;
       * 464 ticks per decade (~0.5% per tick)
       * Mantissa table: 464 uint16 values (1000..9950), packed into a single bytes constant
       * Tick 0 price = 1e18 (1.000 TETC per lot)
-      * Tick range: [-1848, +1848]  (i.e., [-4 decades, +4 decades])
+      * Tick range: [-2320, +2320]  (i.e., [-5 decades, +5 decades])
+
+  Added for "no-backend / IPFS UI" support:
+  - Events for OrderPlaced / OrderCanceled / OrderFilled
+  - Ring buffer of recent trades (constant-size, fast eth_call)
+  - Weekly OHLCV candles (block-based week buckets, fast eth_call)
 */
 
 interface IERC20 {
@@ -24,49 +29,12 @@ interface IERC20 {
 /* ===================== Lot CLOB ===================== */
 
 contract SimpleLotTrade {
-    // Tick range: -464*4 .. +464*4
+    // Tick range: -464*5 .. +464*5
     int256 private constant MIN_TICK = -2320;
     int256 private constant MAX_TICK =  2320;
 
     // 464 uint16 values packed big-endian, 2 bytes each.
     // Total bytes = 928 (29*32)
-
-    // See tools/PriceTicks.py for generation script, and verification of approx 1/2 percent steps.
-    // This choice of 4-digit decimal price ticks is for human readability and dust avoidance.
-    // The main point of price steps is to avoid on-chain price wars over tiny market movements.
-
-    // Decimal Mantissa table (464 entries) for human reference:
-    /*
-        1000  1005  1010  1015  1020  1025  1030  1035  1040  1046  1051  1056  1061  1067  1072  1077
-        1083  1088  1093  1099  1104  1110  1115  1121  1126  1132  1138  1143  1149  1155  1161  1166
-        1172  1178  1184  1190  1196  1202  1208  1214  1220  1226  1232  1238  1244  1250  1256  1263
-        1269  1275  1282  1288  1294  1301  1307  1314  1320  1327  1334  1340  1347  1354  1360  1367
-        1374  1381  1388  1394  1401  1408  1415  1422  1429  1437  1444  1451  1458  1465  1473  1480
-        1487  1495  1502  1510  1517  1525  1532  1540  1548  1555  1563  1571  1579  1586  1594  1602
-        1610  1618  1626  1634  1643  1651  1659  1667  1675  1684  1692  1701  1709  1718  1726  1735
-        1743  1752  1761  1769  1778  1787  1796  1805  1814  1823  1832  1841  1850  1860  1869  1878
-        1887  1897  1906  1916  1925  1935  1944  1954  1964  1974  1983  1993  2003  2013  2023  2033
-        2043  2054  2064  2074  2084  2095  2105  2116  2126  2137  2147  2158  2169  2180  2190  2201
-        2212  2223  2234  2245  2257  2268  2279  2290  2302  2313  2325  2336  2348  2360  2371  2383
-        2395  2407  2419  2431  2443  2455  2467  2480  2492  2504  2517  2529  2542  2555  2567  2580
-        2593  2606  2619  2632  2645  2658  2671  2685  2698  2711  2725  2738  2752  2766  2779  2793
-        2807  2821  2835  2849  2863  2878  2892  2906  2921  2935  2950  2965  2979  2994  3009  3024
-        3039  3054  3070  3085  3100  3116  3131  3147  3162  3178  3194  3210  3226  3242  3258  3274
-        3290  3307  3323  3340  3356  3373  3390  3407  3424  3441  3458  3475  3492  3510  3527  3545
-        3562  3580  3598  3616  3634  3652  3670  3688  3707  3725  3743  3762  3781  3800  3819  3838
-        3857  3876  3895  3914  3934  3954  3973  3993  4013  4033  4053  4073  4093  4114  4134  4155
-        4175  4196  4217  4238  4259  4280  4302  4323  4344  4366  4388  4410  4432  4454  4476  4498
-        4520  4543  4565  4588  4611  4634  4657  4680  4703  4727  4750  4774  4798  4822  4846  4870
-        4894  4918  4943  4967  4992  5017  5042  5067  5092  5117  5143  5168  5194  5220  5246  5272
-        5298  5325  5351  5378  5405  5431  5458  5486  5513  5540  5568  5596  5623  5651  5680  5708
-        5736  5765  5793  5822  5851  5880  5910  5939  5968  5998  6028  6058  6088  6118  6149  6179
-        6210  6241  6272  6303  6335  6366  6398  6430  6462  6494  6526  6559  6591  6624  6657  6690
-        6723  6757  6790  6824  6858  6892  6927  6961  6996  7030  7065  7101  7136  7171  7207  7243
-        7279  7315  7352  7388  7425  7462  7499  7536  7574  7611  7649  7687  7726  7764  7803  7841
-        7880  7920  7959  7999  8038  8078  8119  8159  8200  8240  8281  8323  8364  8406  8447  8489
-        8532  8574  8617  8660  8703  8746  8790  8833  8877  8921  8966  9010  9055  9100  9145  9191
-        9237  9283  9329  9375  9422  9469  9516  9563  9611  9659  9707  9755  9803  9852  9901  9950
-    */
 
     // Packed mantissa bytes
     bytes internal constant MANT =
@@ -101,10 +69,6 @@ contract SimpleLotTrade {
         hex"241524432471249f24ce24fd252c255b258b25bb25eb261b264b267c26ad26de";
 
     // Precomputed order of magnitude factors (1e10 .. 1e19), big-endian uint256 words.
-    // Actual prices are mantissa * decade_factor, 1000 to 10000 times the factor.
-    // These are the limited range of decades needed for tick range -2320 to +2320
-    // This range was chosen for mathematical safety, and prices are not expected
-    //     to go anywhere near these extremes in practice.
     bytes internal constant DECADES =
         hex"00000000000000000000000000000000000000000000000000000002540be400"  // 1e10
         hex"000000000000000000000000000000000000000000000000000000174876e800"  // 1e11
@@ -118,15 +82,141 @@ contract SimpleLotTrade {
         hex"0000000000000000000000000000000000000000000000008ac7230489e80000"; // 1e19
 
     IERC20 public immutable TETC;    // quote token (18 decimals)
-    IERC20 public immutable TKN10K; // base token (0 decimals, integer lots)
+    IERC20 public immutable TKN10K;  // base token (0 decimals, integer lots)
 
     int256 private constant NONE = type(int256).min;
 
-    // Oracle
+    /* ---------- Events (UI change stream) ---------- */
+
+    event OrderPlaced(
+        uint256 indexed id,
+        address indexed owner,
+        bool indexed isBuy,
+        int256 tick,
+        uint256 lots,
+        uint256 escrowedAmount // TETC for buys, TKN10K-lots for sells
+    );
+
+    event OrderCanceled(
+        uint256 indexed id,
+        address indexed owner,
+        bool indexed isBuy,
+        int256 tick,
+        uint256 lotsCanceled,
+        uint256 refundAmount // TETC for buys, TKN10K-lots for sells
+    );
+
+    event OrderFilled(
+        uint256 indexed id,
+        address indexed maker,
+        address indexed taker,
+        bool makerIsBuy,
+        int256 tick,
+        uint256 lotsFilled,
+        uint256 quotePaid // TETC amount
+    );
+
+    /* ---------- "Recent trades" ring buffer (fast eth_call tape) ---------- */
+
+    uint256 public constant RECENT_N = 512;
+    uint256 public recentTradeIndex; // monotonically increasing
+
+    struct RecentTrade {
+        uint64 blockNumber;
+        int32  tick;
+        uint128 lots;
+        uint8  flags; // bit0 = takerIsBuy
+    }
+
+    mapping(uint256 => RecentTrade) private _recentTrades; // index%RECENT_N -> RecentTrade
+
+    function getRecentTrades(uint256 count) external view returns (RecentTrade[] memory out) {
+        if (count > RECENT_N) count = RECENT_N;
+        uint256 end = recentTradeIndex; // one past last
+        uint256 start = end > count ? end - count : 0;
+        uint256 n = end - start;
+        out = new RecentTrade[](n);
+
+        for (uint256 k = 0; k < n; k++) {
+            out[k] = _recentTrades[(start + k) % RECENT_N];
+        }
+    }
+
+    function _recordRecentTrade(int256 tick, uint256 lots, bool takerIsBuy) internal {
+        // Clamp only by type-casts that should be safe for your intended market sizes.
+        // If you expect > 2^128 lots per fill, you should widen this.
+        require(lots <= type(uint128).max, "lots too big");
+
+        uint256 i = recentTradeIndex++;
+        _recentTrades[i % RECENT_N] = RecentTrade({
+            blockNumber: uint64(block.number),
+            tick: int32(tick),
+            lots: uint128(lots),
+            flags: takerIsBuy ? uint8(1) : uint8(0)
+        });
+    }
+
+    /* ---------- Weekly OHLCV candles (block-based buckets) ---------- */
+
+    // ETC target is ~13s; 7 days ~ 46500 blocks. Adjust if you want a different cadence.
+    uint256 public constant BLOCKS_PER_WEEK = 46500;
+
+    struct Candle {
+        bool   exists;
+        int32  open;
+        int32  high;
+        int32  low;
+        int32  close;
+        uint128 volumeLots;
+        uint64  firstBlock;
+        uint64  lastBlock;
+    }
+
+    mapping(uint256 => Candle) public weekly; // weekIndex => Candle
+
+    function currentWeekIndex() public view returns (uint256) {
+        return block.number / BLOCKS_PER_WEEK;
+    }
+
+    function getWeeklyCandles(uint256 startWeek, uint256 count) external view returns (Candle[] memory out) {
+        out = new Candle[](count);
+        for (uint256 i = 0; i < count; i++) {
+            out[i] = weekly[startWeek + i];
+        }
+    }
+
+    function _updateWeeklyCandle(int256 tick, uint256 lots) internal {
+        require(lots <= type(uint128).max, "lots too big");
+        uint256 w = block.number / BLOCKS_PER_WEEK;
+
+        Candle storage c = weekly[w];
+        int32 t = int32(tick);
+
+        if (!c.exists) {
+            c.exists = true;
+            c.open = t;
+            c.high = t;
+            c.low = t;
+            c.close = t;
+            c.volumeLots = uint128(lots);
+            c.firstBlock = uint64(block.number);
+            c.lastBlock  = uint64(block.number);
+        } else {
+            if (t > c.high) c.high = t;
+            if (t < c.low)  c.low  = t;
+            c.close = t;
+            c.volumeLots += uint128(lots);
+            c.lastBlock = uint64(block.number);
+        }
+    }
+
+    /* ---------- Oracle ---------- */
+
     int256 public lastTradeTick;
     uint256 public lastTradeBlock;
 
-    // Reentrancy guard (token transfers)
+    /* ---------- Reentrancy guard (token transfers) ---------- */
+
     uint256 private _lock = 1;
     modifier nonReentrant() {
         require(_lock == 1, "reentrancy");
@@ -134,6 +224,8 @@ contract SimpleLotTrade {
         _;
         _lock = 1;
     }
+
+    /* ---------- Book structures ---------- */
 
     struct Order {
         address owner;
@@ -191,22 +283,21 @@ contract SimpleLotTrade {
 
     function priceAtTick(int256 tick) public pure returns (uint256 result) {
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
-    
+
         uint256 t = uint256(tick - MIN_TICK); // safe because of require above
         uint256 d = t / 464;                  // decade index
         uint256 r = t % 464;                  // mantissa index
-    
+
         uint256 i = r * 2;
         uint256 m = (uint256(uint8(MANT[i])) << 8) | uint256(uint8(MANT[i + 1]));
-    
+
         // Copy DECADES to memory so we can reference it in assembly
         bytes memory decadesData = DECADES;
         uint256 factor;
         assembly {
-            // decadesData pointer + 0x20 (skip length) + d*32 to pick the d-th 32-byte word
             factor := mload(add(add(decadesData, 0x20), mul(d, 0x20)))
         }
-    
+
         result = factor * m;
     }
 
@@ -223,17 +314,21 @@ contract SimpleLotTrade {
 
         id = _newOrder(true, tick, lots);
         _enqueue(true, tick, id);
+
+        emit OrderPlaced(id, msg.sender, true, tick, lots, cost);
     }
 
     function placeSell(int256 tick, uint256 lots) external nonReentrant returns (uint256 id) {
         require(lots > 0, "zero lots");
         require(!hasBestBuy || bestBuyTick < tick, "crossing buy book");
-        
+
         // Escrow TKN10K lots in this contract (integer token)
         require(TKN10K.transferFrom(msg.sender, address(this), uint256(lots)), "TKN10K transferFrom failed");
 
         id = _newOrder(false, tick, lots);
         _enqueue(false, tick, id);
+
+        emit OrderPlaced(id, msg.sender, false, tick, lots, lots);
     }
 
     function cancel(uint256 id) external nonReentrant {
@@ -245,10 +340,14 @@ contract SimpleLotTrade {
             uint256 refund = uint256(o.lotsRemaining) * priceAtTick(o.tick);
             require(TETC.transfer(msg.sender, refund), "TETC refund failed");
             buyLevels[o.tick].totalLots -= o.lotsRemaining;
+
+            emit OrderCanceled(id, msg.sender, true, o.tick, o.lotsRemaining, refund);
         } else {
             uint256 refundLots = uint256(o.lotsRemaining);
             require(TKN10K.transfer(msg.sender, refundLots), "TKN10K refund failed");
             sellLevels[o.tick].totalLots -= o.lotsRemaining;
+
+            emit OrderCanceled(id, msg.sender, false, o.tick, o.lotsRemaining, refundLots);
         }
 
         _unlinkOrder(o.isBuy, o.tick, id);
@@ -263,8 +362,6 @@ contract SimpleLotTrade {
 
         uint256 remain = lots;
         int256 t = bestSellTick;
-        int256 lastFilled;
-        bool filled;
 
         while (remain > 0) {
             require(t <= limitTick, "FOK");
@@ -283,12 +380,18 @@ contract SimpleLotTrade {
             // Contract releases escrowed TKN10K to taker
             require(TKN10K.transfer(msg.sender, uint256(f)), "TKN10K deliver failed");
 
+            // Book accounting
             m.lotsRemaining -= f;
             lvl.totalLots -= f;
             remain -= f;
 
-            lastFilled = t;
-            filled = true;
+            // UI + derived data
+            emit OrderFilled(oid, m.owner, msg.sender, false /*makerIsBuy*/, t, f, pay);
+            _recordRecentTrade(t, f, true /*takerIsBuy*/);
+            _updateWeeklyCandle(t, f);
+
+            lastTradeTick = t;
+            lastTradeBlock = block.number;
 
             if (m.lotsRemaining == 0) {
                 _removeHead(false, t);
@@ -304,10 +407,6 @@ contract SimpleLotTrade {
         }
 
         require(remain == 0, "unfilled");
-        if (filled) {
-            lastTradeTick = lastFilled;
-            lastTradeBlock = block.number;
-        }
     }
 
     function takeSellFOK(int256 limitTick, uint256 lots) external nonReentrant {
@@ -316,8 +415,6 @@ contract SimpleLotTrade {
 
         uint256 remain = lots;
         int256 t = bestBuyTick;
-        int256 lastFilled;
-        bool filled;
 
         while (remain > 0) {
             require(t >= limitTick, "FOK");
@@ -336,12 +433,18 @@ contract SimpleLotTrade {
             // Contract releases escrowed TETC to taker
             require(TETC.transfer(msg.sender, pay), "TETC deliver failed");
 
+            // Book accounting
             m.lotsRemaining -= f;
             lvl.totalLots -= f;
             remain -= f;
 
-            lastFilled = t;
-            filled = true;
+            // UI + derived data
+            emit OrderFilled(oid, m.owner, msg.sender, true /*makerIsBuy*/, t, f, pay);
+            _recordRecentTrade(t, f, false /*takerIsBuy*/);
+            _updateWeeklyCandle(t, f);
+
+            lastTradeTick = t;
+            lastTradeBlock = block.number;
 
             if (m.lotsRemaining == 0) {
                 _removeHead(true, t);
@@ -357,10 +460,6 @@ contract SimpleLotTrade {
         }
 
         require(remain == 0, "unfilled");
-        if (filled) {
-            lastTradeTick = lastFilled;
-            lastTradeBlock = block.number;
-        }
     }
 
     /* ---------- Full Book + Depth Views (single-pass, bounded) ---------- */
@@ -623,10 +722,7 @@ contract SimpleLotTrade {
         }
     }
 
-    /* ---------- Price ---------- */
-
-    /// @notice TETC base units (wei-style) per 1 lot at `tick` using 464-ticks/decade mantissa grid.
-    /// @dev tick 0 => 1e18.
+    /* ---------- Convenience Views ---------- */
 
     function getBestTicks() external view returns (bool, int256, bool, int256) {
         return (hasBestBuy, bestBuyTick, hasBestSell, bestSellTick);
