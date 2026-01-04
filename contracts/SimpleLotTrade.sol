@@ -19,10 +19,14 @@ pragma solidity ^0.8.28;
   - No internal balances:
       * Makers escrow tokens in the contract on order placement
       * Escrow released on fill/partial fill/cancel
-  - Events + integrity:
-      * historySeq increments per emitted event
-      * historyHash chains over record hashes of each emitted event
-      * each event includes (seq, newHash) for easy verification
+  - Min Lot Price: ~0.1 TETC per lot; 0.00001 TETC per TKN
+  - Max Lot Price: ~10000 TETC per lot; 1 TETC per TKN
+      * This is not intended for market control, just to limit spam orders at low prices
+      * This is a lot market and relies on a minimum lot price to help limit potential spam
+      * If TKN10K price goes lower than the contract Min, other trading venues should be used
+      * TKN economics should dictate MIN and MAX prices in any real deployment, set accordingly
+      * higher MAX is less of a spam concern since makers must escrow TETC
+      * MAX limit in place mainly for math safety
 */
 
 interface IERC20 {
@@ -33,22 +37,23 @@ interface IERC20 {
 /* ===================== Lot CLOB ===================== */
 
 contract SimpleLotTrade {
-    // Tick range: -464 .. +464*3
-    int256 private constant MIN_TICK = -464;
-    int256 private constant MAX_TICK =  1392;
+    // Tick range: -464 .. +1392
+    int256 private constant MIN_TICK = -464; // ~0.1 TETC per lot; 0.00001 TETC per TKN
+    int256 private constant MAX_TICK =  1392; // ~10000 TETC per lot;  1 TETC per TKN
 
     int256 private constant NONE = type(int256).min;
 
     IERC20 public immutable TETC;    // quote token (18 decimals)
     IERC20 public immutable TKN10K;  // base token (0 decimals, integer lots)
 
-    // Event integrity chain (increments once per emitted event)
-    uint256 public historySeq; // defaults to 0
-    bytes32 public historyHash; // defaults to 0x00..00
-
     // Oracle
     int256 public lastTradeTick;
     uint256 public lastTradeBlock;
+    bool public hasBestBuy;
+    bool public hasBestSell;
+    int256 public bestBuyTick;
+    int256 public bestSellTick;
+
 
     // Reentrancy guard (token transfers)
     uint256 private _lock = 1;
@@ -61,14 +66,7 @@ contract SimpleLotTrade {
 
     /* -------------------- Events -------------------- */
 
-    // Event type tags used in hash records
-    uint8 private constant EVT_PLACE  = 1;
-    uint8 private constant EVT_CANCEL = 2;
-    uint8 private constant EVT_TRADE  = 3;
-
     event OrderPlaced(
-        uint256 indexed seq,
-        bytes32 indexed newHash,
         uint256 indexed orderId,
         address owner,
         bool isBuy,
@@ -78,8 +76,6 @@ contract SimpleLotTrade {
     );
 
     event OrderCanceled(
-        uint256 indexed seq,
-        bytes32 indexed newHash,
         uint256 indexed orderId,
         address owner,
         bool isBuy,
@@ -90,8 +86,6 @@ contract SimpleLotTrade {
 
     // One Trade event per maker fill (FOK taker may generate multiple)
     event Trade(
-        uint256 indexed seq,
-        bytes32 indexed newHash,
         uint256 indexed makerOrderId,
         address taker,
         address maker,
@@ -131,11 +125,6 @@ contract SimpleLotTrade {
     mapping(int256 => TickLevel) public buyLevels;
     mapping(int256 => TickLevel) public sellLevels;
 
-    bool public hasBestBuy;
-    bool public hasBestSell;
-    int256 public bestBuyTick;
-    int256 public bestSellTick;
-
     // Book return structs
     struct BookOrder {
         uint256 id;
@@ -149,8 +138,6 @@ contract SimpleLotTrade {
         uint256 totalLots;
         uint256 orderCount;
     }
-
-    /* -------------------- Price grid tables -------------------- */
 
     // Packed mantissa bytes (464 uint16, big-endian, 2 bytes each)
     bytes internal constant MANT =
@@ -196,34 +183,23 @@ contract SimpleLotTrade {
     /* -------------------- Price -------------------- */
 
     function priceAtTick(int256 tick) public pure returns (uint256 result) {
-    require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
-
-    uint256 t = uint256(tick - MIN_TICK); // safe because of require above
-    uint256 d = t / 464;                  // decade index (0..4)
-    uint256 r = t % 464;                  // mantissa index
-
-    uint256 i = r * 2;
-    uint256 m = (uint256(uint8(MANT[i])) << 8) | uint256(uint8(MANT[i + 1]));
-
-    uint256 factor;
-    if (d == 0) factor = 1e14;
-    else if (d == 1) factor = 1e15;
-    else if (d == 2) factor = 1e16;
-    else if (d == 3) factor = 1e17;
-    else factor = 1e18; // d == 4
-
-    result = factor * m;
-}
-
-    /* -------------------- Hash chain helpers -------------------- */
-
-    function _chainHash(bytes32 recordHash) internal returns (uint256 seq, bytes32 newHash) {
-        // We include seq inside recordHash construction (see callers).
-        // Here we just advance the chain.
-        seq = historySeq + 1;
-        newHash = keccak256(abi.encodePacked(historyHash, recordHash));
-        historySeq = seq;
-        historyHash = newHash;
+        require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
+    
+        uint256 t = uint256(tick - MIN_TICK); // safe because of require above
+        uint256 d = t / 464;                  // decade index (0..4)
+        uint256 r = t % 464;                  // mantissa index
+    
+        uint256 i = r * 2;
+        uint256 m = (uint256(uint8(MANT[i])) << 8) | uint256(uint8(MANT[i + 1]));
+    
+        uint256 factor;
+        if (d == 0) factor = 1e14;
+        else if (d == 1) factor = 1e15;
+        else if (d == 2) factor = 1e16;
+        else if (d == 3) factor = 1e17;
+        else factor = 1e18; // d == 4
+    
+        result = factor * m;
     }
 
     function _emitPlaced(
@@ -234,10 +210,7 @@ contract SimpleLotTrade {
         uint256 lots,
         uint256 escrowAmount
     ) internal {
-        uint256 seq = historySeq + 1;
-        bytes32 rec = keccak256(abi.encode(EVT_PLACE, seq, orderId, owner, isBuy, tick, lots, escrowAmount));
-        (, bytes32 nh) = _chainHash(rec);
-        emit OrderPlaced(seq, nh, orderId, owner, isBuy, tick, lots, escrowAmount);
+        emit OrderPlaced(orderId, owner, isBuy, tick, lots, escrowAmount);
     }
 
     function _emitCanceled(
@@ -248,10 +221,7 @@ contract SimpleLotTrade {
         uint256 lotsCanceled,
         uint256 refundAmount
     ) internal {
-        uint256 seq = historySeq + 1;
-        bytes32 rec = keccak256(abi.encode(EVT_CANCEL, seq, orderId, owner, isBuy, tick, lotsCanceled, refundAmount));
-        (, bytes32 nh) = _chainHash(rec);
-        emit OrderCanceled(seq, nh, orderId, owner, isBuy, tick, lotsCanceled, refundAmount);
+        emit OrderCanceled(orderId, owner, isBuy, tick, lotsCanceled, refundAmount);
     }
 
     function _emitTrade(
@@ -265,26 +235,7 @@ contract SimpleLotTrade {
         uint256 quoteAmount,
         uint256 makerLotsRemainingAfter
     ) internal {
-        uint256 seq = historySeq + 1;
-        bytes32 rec = keccak256(
-            abi.encode(
-                EVT_TRADE,
-                seq,
-                makerOrderId,
-                taker,
-                maker,
-                takerIsBuy,
-                tick,
-                lotsFilled,
-                pricePerLot,
-                quoteAmount,
-                makerLotsRemainingAfter
-            )
-        );
-        (, bytes32 nh) = _chainHash(rec);
         emit Trade(
-            seq,
-            nh,
             makerOrderId,
             taker,
             maker,
@@ -745,8 +696,8 @@ contract SimpleLotTrade {
 
     /* -------------------- Misc views -------------------- */
 
-    function getBestTicks() external view returns (bool, int256, bool, int256) {
-        return (hasBestBuy, bestBuyTick, hasBestSell, bestSellTick);
+    function getBestTicks() external view returns (bool, bool, int256, int256) {
+        return (hasBestBuy, hasBestSell, bestBuyTick, bestSellTick);
     }
 
     function getLevel(bool isBuy, int256 tick) external view returns (
