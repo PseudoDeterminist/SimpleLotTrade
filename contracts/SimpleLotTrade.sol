@@ -2,11 +2,14 @@
 pragma solidity ^0.8.28;
 
 /*
-  SimpleLotTrade v0.6.2 (Design / Mordor Testnet)
+  SimpleLotTrade v0.6.2 (Design / Testnet)
   By PseudoDeterminist
   ----------------------------------------------------------------------------
-  - This contract does on chain price discovery using order book for lot trades
+  - This contract does price discovery using order book for lot trades on Ethereum Classic
+      * This is intended as a high-value, high-assurance trading venue for large trades
+      * Low tx volume, high value trades
       * Simple, gas efficient, secure design
+      * Order book is doubly-linked list and always sorted
   - This is a Test Contract version, using test tokens we have created
       * TETC (Test ETC) as quote token and TKN10K (Test Token 10K) as base Lot token
       * TKN is base token but we wrap that in integer TKN10K lots (1 lot = 10,000 TKN)
@@ -18,9 +21,9 @@ pragma solidity ^0.8.28;
       * Mantissa table: 464 uint16 values (decimal 1000..9950) = 1 decade packed into bytes constant
       * The mantissa represents (limit-excluded) prices from 1000 wei to 9950 wei per lot
       * Tick 0 price = 1e18 (1.000 TETC per lot)
-      * Tick range: [-464, +1392] (5 decades down/up)
-  - Min Lot Price: ~0.1 TETC per lot; 0.00001 TETC per TKN
-  - Max Lot Price: ~10000 TETC per lot; 1 TETC per TKN
+      * Tick range: [-464, +1391] (.1 TETC to just under 1000 TETC price per TKN10K)
+  - Min Lot Price: 0.1 TETC per lot; 0.00001 TETC per TKN
+  - Max Lot Price: 9950 TETC per lot; .995 TETC per TKN
       * This is not intended for market control, just to limit spam orders at low prices
       * This is a lot market and relies on a minimum lot price to help limit potential spam
       * If TKN10K price goes lower than the contract Min, other trading venues should be used
@@ -37,6 +40,9 @@ pragma solidity ^0.8.28;
   - No internal balances:
       * Makers escrow tokens in the contract on order placement
       * Escrow released on fill/partial fill/cancel
+  - MaxQuoteIn / MinQuoteOut protection for takers
+      * Order books can move before taker tx mined
+      * Taker specifies max quote to spend (buy) or min quote to receive (sell)
 */
 
 interface IERC20 {
@@ -47,9 +53,9 @@ interface IERC20 {
 /* ===================== Lot CLOB ===================== */
 
 contract SimpleLotTrade {
-    // Tick range: -464 .. +1392
-    int256 private constant MIN_TICK = -464; // ~0.1 TETC per lot; 0.00001 TETC per TKN
-    int256 private constant MAX_TICK =  1392; // ~10000 TETC per lot;  1 TETC per TKN
+    // Tick range: -464 .. +1391
+    int256 private constant MIN_TICK = -464; // 0.1 TETC per lot; 0.00001 TETC per TKN
+    int256 private constant MAX_TICK =  1391; // 995 TETC per lot;  ~0.1 TETC per TKN
 
     int256 private constant NONE = type(int256).min;
 
@@ -59,8 +65,6 @@ contract SimpleLotTrade {
     // Oracle
     int256 public lastTradeTick;
     uint256 public lastTradeBlock;
-    bool public hasBestBuy;
-    bool public hasBestSell;
     int256 public bestBuyTick;
     int256 public bestSellTick;
 
@@ -204,11 +208,11 @@ contract SimpleLotTrade {
         uint256 m = (uint256(uint8(MANT[i])) << 8) | uint256(uint8(MANT[i + 1]));
     
         uint256 factor;
-        if (d == 0) factor = 1e14;
-        else if (d == 1) factor = 1e15;
-        else if (d == 2) factor = 1e16;
-        else if (d == 3) factor = 1e17;
-        else factor = 1e18; // d == 4
+        if (d == 0) factor = 1e14;       //  0.1 to  0.995 TETC per TKN10K = 0.00001 to  0.0000995 TETC per TKN
+        else if (d == 1) factor = 1e15;  //    1 to   9.95 TETC per TKN10K = 0.0001  to  0.000995  TETC per TKN
+        else if (d == 2) factor = 1e16;  //   10 to    995 TETC per TKN10K = 0.001   to  0.00995   TETC per TKN
+        else if (d == 3) factor = 1e17;  //  100 to    995 TETC per TKN10K = 0.01    to  0.0995    TETC per TKN
+        else factor = 1e18;              // 1000 to   9950 TETC per TKN10K = 0.1     to  0.995     TETC per TKN
     
         result = factor * m;
     }
@@ -263,7 +267,7 @@ contract SimpleLotTrade {
 
     function placeBuy(int256 tick, uint256 lots) external nonReentrant returns (uint256 id) {
         require(lots > 0, "zero lots");
-        require(!hasBestSell || bestSellTick > tick, "crossing sell book");
+        require(bestSellTick==NONE || bestSellTick > tick, "crossing sell book");
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
 
         uint256 price = priceAtTick(tick);
@@ -280,7 +284,7 @@ contract SimpleLotTrade {
 
     function placeSell(int256 tick, uint256 lots) external nonReentrant returns (uint256 id) {
         require(lots > 0, "zero lots");
-        require(!hasBestBuy || bestBuyTick < tick, "crossing buy book");
+        require(bestBuyTick==NONE || bestBuyTick < tick, "crossing buy book");
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
 
         // Escrow TKN10K lots in this contract
@@ -318,9 +322,8 @@ contract SimpleLotTrade {
 
     /* -------------------- Taker FOK -------------------- */
 
-    function takeBuyFOK(int256 limitTick, uint256 lots, uint256 maxQuoteIn, uint256 deadlineBlock) external nonReentrant {
-        require(block.number <= deadlineBlock, "expired");
-        require(hasBestSell, "no sells");
+    function takeBuyFOK(int256 limitTick, uint256 lots, uint256 maxQuoteIn) external nonReentrant {
+        require(bestSellTick != NONE, "There are no sell orders on book");
         require(lots > 0, "zero lots");
     
         uint256 remain = lots;
@@ -383,9 +386,8 @@ contract SimpleLotTrade {
         lastTradeBlock = block.number;
     }
     
-    function takeSellFOK(int256 limitTick, uint256 lots, uint256 minQuoteOut, uint256 deadlineBlock) external nonReentrant {
-        require(block.number <= deadlineBlock, "expired");
-        require(hasBestBuy, "no buys");
+    function takeSellFOK(int256 limitTick, uint256 lots, uint256 minQuoteOut) external nonReentrant {
+        require(bestBuyTick != NONE, "there are no buy orders on book");
         require(lots > 0, "zero lots");
     
         uint256 remain = lots;
@@ -472,9 +474,9 @@ contract SimpleLotTrade {
         if (maxOrders == 0) return (new BookOrder[](0), 0);
 
         if (isBuy) {
-            if (!hasBestBuy) return (new BookOrder[](0), 0);
+            if (bestBuyTick == NONE) return (new BookOrder[](0), 0);
         } else {
-            if (!hasBestSell) return (new BookOrder[](0), 0);
+            if (bestSellTick == NONE) return (new BookOrder[](0), 0);
         }
 
         out = new BookOrder[](maxOrders);
@@ -531,9 +533,9 @@ contract SimpleLotTrade {
         if (maxLevels == 0) return (new BookLevel[](0), 0);
 
         if (isBuy) {
-            if (!hasBestBuy) return (new BookLevel[](0), 0);
+            if (bestBuyTick == NONE) return (new BookLevel[](0), 0);
         } else {
-            if (!hasBestSell) return (new BookLevel[](0), 0);
+            if (bestSellTick == NONE) return (new BookLevel[](0), 0);
         }
 
         out = new BookLevel[](maxLevels);
@@ -557,21 +559,17 @@ contract SimpleLotTrade {
     }
 
     function getTopOfBook() external view returns (
-        bool hasBuy, int256 buyTick, uint256 buyLots, uint256 buyOrders,
-        bool hasSell, int256 sellTick, uint256 sellLots, uint256 sellOrders
+        bestBuyTick, uint256 buyLots, uint256 buyOrders,
+        bestSellTick, uint256 sellLots, uint256 sellOrders
     ) {
-        hasBuy = hasBestBuy;
-        buyTick = bestBuyTick;
-        if (hasBuy) {
-            TickLevel storage b = buyLevels[buyTick];
+        if (bestBuyTick != NONE) {
+            TickLevel storage b = buyLevels[bestBuyTick];
             buyLots = b.totalLots;
             buyOrders = b.orderCount;
         }
 
-        hasSell = hasBestSell;
-        sellTick = bestSellTick;
-        if (hasSell) {
-            TickLevel storage s = sellLevels[sellTick];
+        if (bestSellTick != NONE) {
+            TickLevel storage s = sellLevels[bestSellTick];
             sellLots = s.totalLots;
             sellOrders = s.orderCount;
         }
@@ -611,8 +609,7 @@ contract SimpleLotTrade {
         lvl.next = NONE;
 
         if (isBuy) {
-            if (!hasBestBuy) {
-                hasBestBuy = true;
+            if (bestBuyTick == NONE) {
                 bestBuyTick = tick;
                 return;
             }
@@ -635,8 +632,7 @@ contract SimpleLotTrade {
                 cur = nxt;
             }
         } else {
-            if (!hasBestSell) {
-                hasBestSell = true;
+            if (bestSellTick == NONE) {
                 bestSellTick = tick;
                 return;
             }
@@ -694,21 +690,19 @@ contract SimpleLotTrade {
             if (p == NONE) bestBuyTick = n;
             else buyLevels[p].next = n;
             if (n != NONE) buyLevels[n].prev = p;
-            if (bestBuyTick == NONE) hasBestBuy = false;
             delete buyLevels[tick];
         } else {
             if (p == NONE) bestSellTick = n;
             else sellLevels[p].next = n;
             if (n != NONE) sellLevels[n].prev = p;
-            if (bestSellTick == NONE) hasBestSell = false;
             delete sellLevels[tick];
         }
     }
 
     /* -------------------- Misc views -------------------- */
 
-    function getOracle() external view returns (bool, bool, int256, int256, int256, uint256) {
-        return (hasBestBuy, hasBestSell, bestBuyTick, bestSellTick, lastTradeTick, lastTradeBlock);
+    function getOracle() external view returns (int256, int256, int256, uint256) {
+        return (bestBuyTick, bestSellTick, lastTradeTick, lastTradeBlock);
     }
 
     function getLevel(bool isBuy, int256 tick) external view returns (
