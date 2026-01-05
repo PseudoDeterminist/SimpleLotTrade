@@ -559,9 +559,14 @@ contract SimpleLotTrade {
     }
 
     function getTopOfBook() external view returns (
-        bestBuyTick, uint256 buyLots, uint256 buyOrders,
-        bestSellTick, uint256 sellLots, uint256 sellOrders
+        int256, uint256, uint256,
+        int256, uint256, uint256
     ) {
+        uint256 buyLots;
+        uint256 buyOrders;
+        uint256 sellLots;
+        uint256 sellOrders;
+
         if (bestBuyTick != NONE) {
             TickLevel storage b = buyLevels[bestBuyTick];
             buyLots = b.totalLots;
@@ -573,6 +578,8 @@ contract SimpleLotTrade {
             sellLots = s.totalLots;
             sellOrders = s.orderCount;
         }
+
+        return (bestBuyTick, buyLots, buyOrders, bestSellTick, sellLots, sellOrders);
     }
 
     /* -------------------- Internals: Orders / Levels -------------------- */
