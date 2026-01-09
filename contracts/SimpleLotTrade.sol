@@ -59,7 +59,7 @@ interface IERC20 {
 contract SimpleLotrade {
     // Tick range: -464 .. +1391
     int256 private constant MIN_TICK = -464; // 0.1 TETC per lot; 0.00001 TETC per TKN
-    int256 private constant MAX_TICK =  1391; // 995 TETC per lot;  ~0.1 TETC per TKN
+    int256 private constant MAX_TICK =  1855; // 995 TETC per lot;  ~0.1 TETC per TKN
 
     int256 private constant NONE = type(int256).min;
 
