@@ -2,7 +2,7 @@
 pragma solidity ^0.8.28;
 
 /*
-  SimpleLotrade v0.6.2 (Design / Testnet)
+  SimpleLotrade v0.6.3 (Design / Testnet)
   By PseudoDeterminist
   ----------------------------------------------------------------------------
   - This contract does price discovery using order book for lot trades on Ethereum Classic
@@ -57,9 +57,9 @@ interface IERC20 {
 /* ===================== Lot CLOB ===================== */
 
 contract SimpleLotrade {
-    // Tick range: -464 .. +1391
+    // Tick range: -464 .. +1855 (5 decades * 464 ticks/decade)
     int256 private constant MIN_TICK = -464; // 0.1 TETC per lot; 0.00001 TETC per TKN
-    int256 private constant MAX_TICK =  1855; // 995 TETC per lot;  ~0.1 TETC per TKN
+    int256 private constant MAX_TICK =  1855; // 9950 TETC per lot; 0.995 TETC per TKN
 
     int256 private constant NONE = type(int256).min;
 
@@ -75,6 +75,10 @@ contract SimpleLotrade {
     uint256 public lastradeBlock;
     int256 public bestBuyTick;
     int256 public bestSellTick;
+
+    // Running escrow totals (resting maker escrows)
+    uint256 public totalBuyEscrowTETC;     // total TETC held by contract for buy makers
+    uint256 public totalSellEscrowTKN10K;  // total TKN10K held by contract for sell makers
 
     // Reentrancy guard (token transfers)
     uint256 private _lock = 1;
@@ -148,7 +152,8 @@ contract SimpleLotrade {
         uint256 head;
         uint256 tail;
         uint256 orderCount;
-        uint256 totalLots;
+        uint256 totalLots;   // total lotsRemaining at this tick
+        uint256 totalQuote;  // ONLY meaningful for buyLevels: sum(lotsRemaining * priceAtTick(tick))
     }
 
     uint256 public nextOrderId = 1;
@@ -158,13 +163,6 @@ contract SimpleLotrade {
     mapping(int256 => TickLevel) public sellLevels;
 
     // Book return structs
-    struct BookOrder {
-        uint256 id;
-        address owner;
-        int256 tick;
-        uint256 lotsRemaining;
-    }
-
     struct BookLevel {
         int256 tick;
         uint256 totalLots;
@@ -215,27 +213,27 @@ contract SimpleLotrade {
 
     /* -------------------- Price -------------------- */
 
-    function priceAtick(int256 tick) public pure returns (uint256 result) {
+    function priceAtTick(int256 tick) public pure returns (uint256 result) {
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
 
         uint256 t = uint256(tick - MIN_TICK); // safe because of require above
         uint256 d = t / 464;                  // decade index (0..4)
-        uint256 r = t % 464;                  // mantissa index
+        uint256 r = t % 464;                  // mantissa index (0..463)
 
         uint256 i = r * 2;
         uint256 m = (uint256(uint8(MANT[i])) << 8) | uint256(uint8(MANT[i + 1]));
 
         uint256 factor;
-        if (d == 0) factor = 1e14;       //  0.1 to     0.995 TETC per TKN10K = 0.00001 to  0.0000995 TETC per TKN
-        else if (d == 1) factor = 1e15;  //    1 to     9.95  TETC per TKN10K = 0.0001  to  0.000995  TETC per TKN
-        else if (d == 2) factor = 1e16;  //   10 to    99.5   TETC per TKN10K = 0.001   to  0.00995   TETC per TKN
-        else if (d == 3) factor = 1e17;  //  100 to   995     TETC per TKN10K = 0.01    to  0.0995    TETC per TKN
-        else factor = 1e18;              // 1000 to  9950     TETC per TKN10K = 0.1     to  0.995     TETC per TKN
+        if (d == 0) factor = 1e14;       //    0.1 to      0.995 TETC per lot = 0.00001 to  0.0000995 TETC per Base TKN
+        else if (d == 1) factor = 1e15;  //      1 to      9.95  TETC per lot = 0.0001  to  0.000995  TETC per Base TKN
+        else if (d == 2) factor = 1e16;  //     10 to     99.5   TETC per lot = 0.001   to  0.00995   TETC per Base TKN
+        else if (d == 3) factor = 1e17;  //    100 to    995     TETC per lot = 0.01    to  0.0995    TETC per Base TKN
+        else factor = 1e18;              //   1000 to   9950     TETC per lot = 0.1     to  0.995     TETC per Base TKN
 
         result = factor * m;
     }
 
-    /* -------------------- Hash chain helpers (from old contract) -------------------- */
+    /* -------------------- Hash chain helpers -------------------- */
 
     function _chainHash(bytes32 recordHash) internal returns (bytes32 newHash) {
         newHash = keccak256(abi.encodePacked(historyHash, recordHash));
@@ -314,13 +312,17 @@ contract SimpleLotrade {
         require(bestSellTick == NONE || bestSellTick > tick, "crossing sell book");
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
 
-        uint256 cost = lots * priceAtick(tick);
+        uint256 cost = lots * priceAtTick(tick);
 
         // Escrow TETC in this contract
         require(TETC.transferFrom(msg.sender, address(this), cost), "TETC transferFrom failed");
 
         id = _newOrder(true, tick, lots);
         _enqueue(true, tick, id);
+
+        // Track buy escrow (per-level and global)
+        buyLevels[tick].totalQuote += cost;
+        totalBuyEscrowTETC += cost;
 
         _emitPlaced(id, msg.sender, true, tick, lots, cost);
     }
@@ -336,6 +338,9 @@ contract SimpleLotrade {
         id = _newOrder(false, tick, lots);
         _enqueue(false, tick, id);
 
+        // Track sell escrow (global). Per-level is already totalLots.
+        totalSellEscrowTKN10K += lots;
+
         _emitPlaced(id, msg.sender, false, tick, lots, lots);
     }
 
@@ -348,13 +353,18 @@ contract SimpleLotrade {
 
         // Refund remaining escrow
         if (o.isBuy) {
-            refundAmount = uint256(o.lotsRemaining) * priceAtick(o.tick);
+            refundAmount = uint256(o.lotsRemaining) * priceAtTick(o.tick);
             require(TETC.transfer(msg.sender, refundAmount), "TETC refund failed");
+
             buyLevels[o.tick].totalLots -= o.lotsRemaining;
+            buyLevels[o.tick].totalQuote -= refundAmount;
+            totalBuyEscrowTETC -= refundAmount;
         } else {
             refundAmount = uint256(o.lotsRemaining);
             require(TKN10K.transfer(msg.sender, refundAmount), "TKN10K refund failed");
+
             sellLevels[o.tick].totalLots -= o.lotsRemaining;
+            totalSellEscrowTKN10K -= refundAmount;
         }
 
         _unlinkOrder(o.isBuy, o.tick, id);
@@ -380,7 +390,7 @@ contract SimpleLotrade {
             TickLevel storage lvl = sellLevels[t];
             require(lvl.head != 0, "empty level");
 
-            uint256 price = priceAtick(t);
+            uint256 price = priceAtTick(t);
 
             while (remain > 0) {
                 uint256 oid = lvl.head;
@@ -401,8 +411,11 @@ contract SimpleLotrade {
                 // Contract releases escrowed TKN10K to taker
                 require(TKN10K.transfer(msg.sender, f), "TKN10K deliver failed");
 
+                // Update balances
                 m.lotsRemaining -= f;
                 lvl.totalLots -= f;
+                totalSellEscrowTKN10K -= f;
+
                 remain -= f;
 
                 _emitTrade(oid, msg.sender, m.owner, true, t, f, price, pay, m.lotsRemaining);
@@ -444,7 +457,7 @@ contract SimpleLotrade {
             TickLevel storage lvl = buyLevels[t];
             require(lvl.head != 0, "empty level");
 
-            uint256 price = priceAtick(t);
+            uint256 price = priceAtTick(t);
 
             while (remain > 0) {
                 uint256 oid = lvl.head;
@@ -462,8 +475,12 @@ contract SimpleLotrade {
                 // Contract releases escrowed TETC to taker
                 require(TETC.transfer(msg.sender, receiveAmt), "TETC deliver failed");
 
+                // Update balances
                 m.lotsRemaining -= f;
                 lvl.totalLots -= f;
+                lvl.totalQuote -= receiveAmt;
+                totalBuyEscrowTETC -= receiveAmt;
+
                 remain -= f;
 
                 _emitTrade(oid, msg.sender, m.owner, false, t, f, price, receiveAmt, m.lotsRemaining);
@@ -694,6 +711,10 @@ contract SimpleLotrade {
         return (bestBuyTick, bestSellTick, lastradeTick, lastradeBlock);
     }
 
+    function getEscrowTotals() external view returns (uint256 buyTETC, uint256 sellTKN10K) {
+        return (totalBuyEscrowTETC, totalSellEscrowTKN10K);
+    }
+
     function getLevel(bool isBuy, int256 tick) external view returns (
         bool exists,
         int256 prev,
@@ -701,9 +722,10 @@ contract SimpleLotrade {
         uint256 head,
         uint256 tail,
         uint256 orderCount,
-        uint256 totalLots
+        uint256 totalLots,
+        uint256 totalQuote
     ) {
         TickLevel storage l = isBuy ? buyLevels[tick] : sellLevels[tick];
-        return (l.exists, l.prev, l.next, l.head, l.tail, l.orderCount, l.totalLots);
+        return (l.exists, l.prev, l.next, l.head, l.tail, l.orderCount, l.totalLots, l.totalQuote);
     }
 }
