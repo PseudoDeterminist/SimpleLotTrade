@@ -7,15 +7,13 @@ pragma solidity ^0.8.28;
   See README at https://github.com/PseudoDeterminist/SimpleLotTrade for details.
 */
 
-interface IERC20 {
-    function transfer(address to, uint256 value) external returns (bool);
-    function transferFrom(address from, address to, uint256 value) external returns (bool);
-    function balanceOf(address account) external view returns (uint256);
-}
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
 
 /* ===================== Lot CLOB ===================== */
 
 contract SimpleLotrade {
+    using SafeERC20 for IERC20;
     // Tick range: -464 .. +1855 (5 decades * 464 ticks/decade)
     int256 private constant MIN_TICK = -464; // 0.1 TETC per lot; 0.00001 TETC per TKN
     int256 private constant MAX_TICK =  1855; // 9950 TETC per lot; 0.995 TETC per TKN
@@ -275,7 +273,7 @@ contract SimpleLotrade {
         uint256 cost = lots * priceAtTick(tick);
 
         // Escrow TETC in this contract
-        require(TETC.transferFrom(msg.sender, address(this), cost), "TETC transferFrom failed");
+        TETC.safeTransferFrom(msg.sender, address(this), cost);
 
         id = _newOrder(true, tick, lots);
         _enqueue(true, tick, id);
@@ -293,7 +291,7 @@ contract SimpleLotrade {
         require(tick >= MIN_TICK && tick <= MAX_TICK, "tick out of range");
 
         // Escrow TKN10K lots in this contract
-        require(TKN10K.transferFrom(msg.sender, address(this), uint256(lots)), "TKN10K transferFrom failed");
+        TKN10K.safeTransferFrom(msg.sender, address(this), uint256(lots));
 
         id = _newOrder(false, tick, lots);
         _enqueue(false, tick, id);
@@ -314,14 +312,14 @@ contract SimpleLotrade {
         // Refund remaining escrow
         if (o.isBuy) {
             refundAmount = uint256(o.lotsRemaining) * priceAtTick(o.tick);
-            require(TETC.transfer(msg.sender, refundAmount), "TETC refund failed");
+            TETC.safeTransfer(msg.sender, refundAmount);
 
             buyLevels[o.tick].totalLots -= o.lotsRemaining;
             buyLevels[o.tick].totalQuote -= refundAmount;
             totalBuyEscrowTETC -= refundAmount;
         } else {
             refundAmount = uint256(o.lotsRemaining);
-            require(TKN10K.transfer(msg.sender, refundAmount), "TKN10K refund failed");
+            TKN10K.safeTransfer(msg.sender, refundAmount);
 
             sellLevels[o.tick].totalLots -= o.lotsRemaining;
             totalSellEscrowTKN10K -= refundAmount;
@@ -367,10 +365,10 @@ contract SimpleLotrade {
                 require(spent <= maxQuoteIn, "slippage");
 
                 // Taker delivers TETC to maker (seller)
-                require(TETC.transferFrom(msg.sender, m.owner, pay), "TETC pay failed");
+                TETC.safeTransferFrom(msg.sender, m.owner, pay);
 
                 // Contract releases escrowed TKN10K to taker
-                require(TKN10K.transfer(msg.sender, f), "TKN10K deliver failed");
+                TKN10K.safeTransfer(msg.sender, f);
 
                 // Update balances
                 m.lotsRemaining -= f;
@@ -431,10 +429,10 @@ contract SimpleLotrade {
                 got += receiveAmt;
 
                 // Taker delivers TKN10K to maker (buyer)
-                require(TKN10K.transferFrom(msg.sender, m.owner, f), "TKN10K pay failed");
+                TKN10K.safeTransferFrom(msg.sender, m.owner, f);
 
                 // Contract releases escrowed TETC to taker
-                require(TETC.transfer(msg.sender, receiveAmt), "TETC deliver failed");
+                TETC.safeTransfer(msg.sender, receiveAmt);
 
                 // Update balances
                 m.lotsRemaining -= f;
